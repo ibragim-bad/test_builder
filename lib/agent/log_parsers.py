@@ -2,6 +2,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from typing import Any
 
 from lib.agent.swe_constants import TestStatus
 
@@ -761,6 +762,9 @@ def parse_log_phpunit(log: str) -> dict[str, str]:
 
     suite_pattern = r"^(\w.+) \(.+\)$"
     test_pattern = r"^\s*([✔✘↩])\s*(.*)$"
+    # Strip trailing timing suffixes like "[1.34 ms]" or "[123 ms]" from test names.
+    # PHPUnit --testdox appends these brackets when --display-incomplete or timing is enabled.
+    _timing_suffix_re = re.compile(r"\s*\[\s*\d+(?:\.\d+)?\s*(?:ms|s)\s*\]\s*$", re.IGNORECASE)
 
     for line in log.split("\n"):
         suite_match = re.match(suite_pattern, line)
@@ -771,6 +775,8 @@ def parse_log_phpunit(log: str) -> dict[str, str]:
         test_match = re.match(test_pattern, line)
         if test_match:
             status, test_name = test_match.groups()
+            # Remove timing suffix before building the key
+            test_name = _timing_suffix_re.sub("", test_name).strip()
             full_test_name = f"{suite} > {test_name}"
 
             if status == "✔":
@@ -894,7 +900,7 @@ def parse_log_gradle_custom(log: str) -> dict[str, str]:
     """
     test_status_map = {}
 
-    pattern = r"^([^>].+)\s+(PASSED|FAILED)$"
+    pattern = r"^([^>].+?)\s+(PASSED|FAILED)(?:\s+\(\d+(?:\.\d+)?s\))?$"
 
     for line in log.split("\n"):
         match = re.match(pattern, line.strip())
@@ -1336,6 +1342,10 @@ def parse_log_cpp_v3(log: str) -> dict[str, str]:
       "[39/414] image_function::GetThreshold (form 1)... OK"
       "[123/414] SomeTest::TestName... FAILED"
 
+    Also handles Botan test runner group-summary lines:
+      "AES-128 ran 17370 tests in 34.33 msec all ok"
+      "ChaCha ran 2048 tests in 12.1 msec 3 tests failed"
+
     Rules implemented:
       - Lines ending with "... OK" or "... OK" indicate PASSED.
       - Lines ending with "... FAILED" or containing "FAIL" indicate FAILED.
@@ -1343,11 +1353,21 @@ def parse_log_cpp_v3(log: str) -> dict[str, str]:
       - The parser extracts the human-friendly test name found after the optional prefix
         like "[12/414]" and before the ellipsis '...'. If there is a parenthesized
         suffix like "(form 1)", it will be included in the test name.
+      - Botan summary lines: timing is stripped from the key so that the key matches
+        the normalised form used in the evaluation dataset.
 
     Returns:
       dict mapping extracted test name to one of: 'PASSED','FAILED','SKIPPED','ERROR'.
     """
     results: dict[str, str] = {}
+
+    # Botan group-summary: "NAME ran N tests in X.XX msec all ok"
+    # or "NAME ran N tests in X.XX msec N tests failed"
+    _botan_re = re.compile(
+        r"^(.*?)\s+ran\s+(\d+)\s+tests\s+in\s+[\d.]+\s+(?:msec|sec)\s+(.+)$",
+        re.IGNORECASE,
+    )
+    _botan_fail_re = re.compile(r"\bfailed\b", re.IGNORECASE)
 
     # Patterns
     # Example: [12/414] File: Save and load ... OK
@@ -1361,6 +1381,19 @@ def parse_log_cpp_v3(log: str) -> dict[str, str]:
         line = raw.strip()
         if not line:
             continue
+
+        # Botan group-summary line — check before generic patterns.
+        bm = _botan_re.match(line)
+        if bm:
+            name, count, tail = bm.group(1).strip(), bm.group(2), bm.group(3).strip()
+            # Key without timing: "NAME ran N tests <tail>" (tail = "all ok" / "N tests failed")
+            key = f"{name} ran {count} tests {tail}"
+            if _botan_fail_re.search(tail):
+                results[key] = TestStatus.FAILED.value
+            else:
+                results[key] = TestStatus.PASSED.value
+            continue
+
         # Direct structured match: capture name before '... <STATUS>'
         m = line_re.match(line)
         if m:
@@ -1461,16 +1494,49 @@ def parse_lue_nvim(log: str) -> dict[str, str]:
     return results
 
 
+def _mvn_failure_status(line: str) -> str:
+    if "Exception" in line and "AssertionError" not in line:
+        return TestStatus.ERROR.value
+    return TestStatus.FAILED.value
+
+
+def _mvn_summary_class(line: str, current_running: str | None) -> str | None:
+    if " in " in line:
+        return line.rsplit(" in ", 1)[-1].strip().rstrip(".:;")
+    return current_running
+
+
+def _mvn_status_from_summary_counts(failures: int, errors: int, skipped: int) -> str:
+    if failures == 0 and errors == 0:
+        if skipped == 0:
+            return TestStatus.PASSED.value
+        return TestStatus.SKIPPED.value
+    return TestStatus.FAILED.value
+
+
 def parse_java_mvn(log: str) -> dict[str, str]:
-    """Parse Maven Surefire log into {identifier: status} like parse_log_elixir."""
+    """Parse Maven logs into {identifier: status}.
+
+    Supports both:
+      * Surefire/Failsafe style lines:
+        - `[INFO] Running <class>`
+        - `Tests run: X, Failures: Y, Errors: Z, Skipped: W`
+        - `[ERROR] <class>.<method>:<line> ...`
+      * `mvn -Dtest=...` flows that only emit `BUILD SUCCESS|FAILURE`
+        (delegates to `parse_log_maven` as a fallback signal source).
+    """
     results: dict[str, str] = {}
 
     failure_re = re.compile(
         r"^\[ERROR\]\s+(?P<class>[A-Za-z0-9_$.]+)\.(?P<method>[A-Za-z0-9_$.]+?)(?::(?P<line>\d+))?\b"
     )
-    running_re = re.compile(r"^\[INFO\]\s+Running\s+([A-Za-z0-9_$.]+)$")
+    running_re = re.compile(r"^(?:\[INFO\]\s+)?Running\s+([A-Za-z0-9_$.]+)$")
+    summary_re = re.compile(
+        r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)"
+    )
 
     seen_running: set[str] = set()
+    current_running: str | None = None
 
     for raw in log.splitlines():
         line = raw.strip()
@@ -1478,45 +1544,35 @@ def parse_java_mvn(log: str) -> dict[str, str]:
             continue
         rm = running_re.match(line)
         if rm:
-            seen_running.add(rm.group(1))
+            running_name = rm.group(1)
+            current_running = running_name
+            seen_running.add(running_name)
+            continue
         fm = failure_re.match(line)
         if fm:
             clazz = fm.group("class")
             method = fm.group("method")
             test_id = f"{clazz}.{method}"
-            status = (
-                TestStatus.ERROR.value
-                if ("Exception" in line and "AssertionError" not in line)
-                else TestStatus.FAILED.value
-            )
-            results[test_id] = status
+            results[test_id] = _mvn_failure_status(line)
             results.setdefault(clazz, TestStatus.FAILED.value)
             continue
-        if (
-            "Tests run:" in line
-            and "Failures:" in line
-            and "Errors:" in line
-            and "Skipped:" in line
-            and "Time elapsed:" in line
-            and " in " in line
-        ):
-            # Use small helper to fetch counters
-            def grab(label: str, text: str = line) -> int | None:
-                m = re.search(label + r":\s*(\d+)", text)
-                return int(m.group(1)) if m else None
 
-            failures = grab("Failures")
-            errors = grab("Errors")
-            skipped = grab("Skipped")
-            if failures is None or errors is None or skipped is None:
-                continue
-            clazz = line.rsplit(" in ", 1)[-1].strip().rstrip(".:;")
-            if failures == 0 and errors == 0 and skipped == 0:
-                results.setdefault(clazz, TestStatus.PASSED.value)
-            elif failures == 0 and errors == 0 and skipped > 0:
-                results.setdefault(clazz, TestStatus.SKIPPED.value)
-            else:
-                results.setdefault(clazz, TestStatus.FAILED.value)
+        sm = summary_re.search(line)
+        if sm:
+            _tests_run, failures, errors, skipped = map(int, sm.groups())
+            clazz = _mvn_summary_class(line, current_running)
+            if clazz:
+                status = _mvn_status_from_summary_counts(failures, errors, skipped)
+                results.setdefault(clazz, status)
+            current_running = None
+
+    # Fallback for logs where only junit XML snippets are emitted inline.
+    for test_name, status in parse_log_junit(log).items():
+        results.setdefault(test_name, status)
+
+    # Fallback for logs where only `-Dtest=<name>` + BUILD SUCCESS/FAILURE exists.
+    for test_name, status in parse_log_maven(log).items():
+        results.setdefault(test_name, status)
 
     if not results and seen_running:
         for clazz in seen_running:
@@ -1532,37 +1588,8 @@ def parse_log_sbt(log: str) -> dict[str, str]:
       * Extract testcase elements with their name and classname
       * Determine status: PASSED (no failure/error/skipped), FAILED, ERROR, or SKIPPED
     """
-    results: dict[str, str] = {}
+    return _parse_junit_testcases_from_text(log, joiner=" ")
 
-    # Use regex to extract testcase elements directly since full XML may be malformed
-    # Match testcase opening tag with attributes
-    testcase_re = re.compile(
-        r'<testcase\s+classname="([^"]*)"\s+name="([^"]*)"[^>]*>'
-        r'(.*?)</testcase>',
-        re.DOTALL
-    )
-    
-    for match in testcase_re.finditer(log):
-        classname = match.group(1)
-        name = match.group(2)
-        content = match.group(3)
-        
-        # Create full test name
-        full_name = f"{classname} {name}" if classname else name
-        
-        # Determine status based on content
-        if "<failure" in content:
-            status = TestStatus.FAILED.value
-        elif "<error" in content:
-            status = TestStatus.ERROR.value
-        elif "<skipped" in content:
-            status = TestStatus.SKIPPED.value
-        else:
-            status = TestStatus.PASSED.value
-        
-        results[full_name] = status
-    
-    return results
 
 def parse_log_junit(log: str) -> dict[str, str]:
     """Parse Scala sbt test output (JUnit XML format) and return {full_test_name: status}.
@@ -1572,25 +1599,53 @@ def parse_log_junit(log: str) -> dict[str, str]:
       * Extract testcase elements with their name and classname
       * Determine status: PASSED (no failure/error/skipped), FAILED, ERROR, or SKIPPED
     """
+    return _parse_junit_testcases_from_text(log, joiner=" ")
+
+
+def _parse_junit_testcases_from_text(log: str, joiner: str = " ") -> dict[str, str]:
+    """Parse junit-like testcase fragments from raw text.
+
+    Works with:
+      * attribute order variations (name before classname, etc.);
+      * both self-closing and expanded testcase tags;
+      * concatenated XML documents in noisy logs.
+    """
     results: dict[str, str] = {}
 
-    # Use regex to extract testcase elements directly since full XML may be malformed
-    # Match testcase opening tag with attributes
-    testcase_re = re.compile(
-        r'<testcase\s+classname="([^"]*)"\s+name="([^"]*)"[^>]*>'
-        r'(.*?)</testcase>',
-        re.DOTALL
-    )
-    
-    for match in testcase_re.finditer(log):
-        classname = match.group(1)
-        name = match.group(2)
-        content = match.group(3)
-        
-        # Create full test name
-        full_name = f"{classname} {name}" if classname else name
-        
-        # Determine status based on content
+    open_tag_re = re.compile(r"<testcase\b([^>]*)>", re.DOTALL)
+    attr_re = re.compile(r'(\w+)="([^"]*)"')
+
+    pos = 0
+    while True:
+        match = open_tag_re.search(log, pos)
+        if match is None:
+            break
+
+        raw_attrs = match.group(1) or ""
+        attrs = dict(attr_re.findall(raw_attrs))
+        name = attrs.get("name")
+        classname = attrs.get("classname", "")
+
+        if not name:
+            pos = match.end()
+            continue
+
+        is_self_closing = raw_attrs.strip().endswith("/")
+        content = ""
+        if not is_self_closing:
+            close_pos = log.find("</testcase>", match.end())
+            if close_pos != -1:
+                content = log[match.end() : close_pos]
+                pos = close_pos + len("</testcase>")
+            else:
+                # Malformed logs: fallback to a bounded window.
+                content = log[match.end() : match.end() + 4096]
+                pos = match.end()
+        else:
+            pos = match.end()
+
+        full_name = f"{classname}{joiner}{name}".strip() if classname else name
+
         if "<failure" in content:
             status = TestStatus.FAILED.value
         elif "<error" in content:
@@ -1599,9 +1654,9 @@ def parse_log_junit(log: str) -> dict[str, str]:
             status = TestStatus.SKIPPED.value
         else:
             status = TestStatus.PASSED.value
-        
+
         results[full_name] = status
-    
+
     return results
 
 def parse_java_mvn_v2(log: str) -> dict[str, str]:
@@ -2695,6 +2750,69 @@ def parse_log_lein(log: str) -> dict[str, str]:  # noqa: PLR0912
     return results
 
 
+def _iter_dart_protocol_events(log: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for raw in log.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            decoded = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(decoded, dict):
+            events.append(decoded)
+        elif isinstance(decoded, list):
+            events.extend(item for item in decoded if isinstance(item, dict))
+    return events
+
+
+def _handle_dart_test_start(
+    event: dict[str, Any], test_id_to_name: dict[int, str]
+) -> None:
+    test_info = event.get("test")
+    if not isinstance(test_info, dict):
+        return
+
+    test_id = test_info.get("id")
+    test_name = test_info.get("name")
+    if test_id is None or not test_name or test_name.startswith("loading "):
+        return
+
+    test_id_to_name[test_id] = test_name
+
+
+def _dart_done_status(event: dict[str, Any]) -> str | None:
+    result = event.get("result")
+    if result == "success":
+        return TestStatus.PASSED.value
+    if result == "failure":
+        return TestStatus.FAILED.value
+    if result == "error":
+        return TestStatus.ERROR.value
+    if event.get("skipped", False):
+        return TestStatus.SKIPPED.value
+    return None
+
+
+def _handle_dart_test_done(
+    event: dict[str, Any], test_id_to_name: dict[int, str], results: dict[str, str]
+) -> None:
+    test_id = event.get("testID")
+    if test_id is None or event.get("hidden", False):
+        return
+    if test_id not in test_id_to_name:
+        return
+
+    status = _dart_done_status(event)
+    if status is None:
+        return
+
+    test_name = test_id_to_name[test_id]
+    results[test_name] = status
+
+
 def parse_log_dart(log: str) -> dict[str, str]:
     """Parse Dart test output and return {test_name: status}.
 
@@ -2707,50 +2825,13 @@ def parse_log_dart(log: str) -> dict[str, str]:
     results: dict[str, str] = {}
     test_id_to_name: dict[int, str] = {}
 
-    for line in log.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
+    for event in _iter_dart_protocol_events(log):
         event_type = event.get("type")
-
-        # Map test IDs to names from testStart events
         if event_type == "testStart":
-            test_info = event.get("test", {})
-            test_id = test_info.get("id")
-            test_name = test_info.get("name")
-            if (
-                test_id is not None
-                and test_name
-                and not test_name.startswith("loading ")
-            ):
-                # Skip hidden "loading" tests
-                test_id_to_name[test_id] = test_name
-
-        # Map test results from testDone events
-        elif event_type == "testDone":
-            test_id = event.get("testID")
-            result = event.get("result")
-            hidden = event.get("hidden", False)
-
-            # Skip hidden tests (like loading tests)
-            if test_id is not None and not hidden and test_id in test_id_to_name:
-                test_name = test_id_to_name[test_id]
-
-                # Map Dart result to TestStatus
-                if result == "success":
-                    results[test_name] = TestStatus.PASSED.value
-                elif result == "failure":
-                    results[test_name] = TestStatus.FAILED.value
-                elif result == "error":
-                    results[test_name] = TestStatus.ERROR.value
-                elif event.get("skipped", False):
-                    results[test_name] = TestStatus.SKIPPED.value
+            _handle_dart_test_start(event, test_id_to_name)
+            continue
+        if event_type == "testDone":
+            _handle_dart_test_done(event, test_id_to_name, results)
 
     return results
 
@@ -3349,9 +3430,9 @@ def parse_log_swift(log: str) -> dict[str, str]:
             status = m.group(2).upper()
             
             if status == "PASSED":
-                results[test_name] = TestStatus.PASSED
+                results[test_name] = TestStatus.PASSED.value
             elif status == "FAILED":
-                results[test_name] = TestStatus.FAILED
+                results[test_name] = TestStatus.FAILED.value
     
     return results
 
@@ -3416,6 +3497,13 @@ parse_log_sphinx = parse_log_pytest_v2
 
 parse_log_pydantic = parse_log_pytest
 parse_log_dvc = parse_log_pytest
+parse_lua_nvim = parse_lue_nvim
+parse_log_lua_nvim = parse_lue_nvim
+parse_log_java_mvn = parse_java_mvn
+parse_log_java_mvn_v2 = parse_java_mvn_v2
+parse_log_r_junit = parse_logs_r_junit
+parse_log_kotlin_junit = parse_logs_kotlin_junit
+parse_log_ocaml_v5 = parse_log_ocaml_v4
 
 MAP_REPO_TO_PARSER = {
     "astropy/astropy": parse_log_astropy,
@@ -3480,8 +3568,12 @@ NAME_TO_PARSER = {
     "parse_log_cpp_v3": parse_log_cpp_v3,
     "parse_log_cpp_v4": parse_log_cpp_v4,
     "parse_lue_nvim": parse_lue_nvim,
+    "parse_lua_nvim": parse_lua_nvim,
+    "parse_log_lua_nvim": parse_log_lua_nvim,
     "parse_java_mvn": parse_java_mvn,
+    "parse_log_java_mvn": parse_log_java_mvn,
     "parse_java_mvn_v2": parse_java_mvn_v2,
+    "parse_log_java_mvn_v2": parse_log_java_mvn_v2,
     "parse_log_php_v1": parse_log_php_v1,
     "parse_log_ruby_v2": parse_log_ruby_v2,
     "parse_log_haskell": parse_log_haskell,
@@ -3506,10 +3598,13 @@ NAME_TO_PARSER = {
     "parse_log_ocaml_v2": parse_log_ocaml_v2,
     "parse_log_ocaml_v3": parse_log_ocaml_v3,
     "parse_log_ocaml_v4": parse_log_ocaml_v4,
+    "parse_log_ocaml_v5": parse_log_ocaml_v5,
     "parse_log_sbt": parse_log_sbt,
     "parse_log_junit": parse_log_junit,
     "parse_logs_r_junit": parse_logs_r_junit,
     "parse_logs_kotlin_junit": parse_logs_kotlin_junit,
+    "parse_log_r_junit": parse_log_r_junit,
+    "parse_log_kotlin_junit": parse_log_kotlin_junit,
     "parse_log_swift": parse_log_swift,
-    "parse_log_csharp": parse_log_csharp
+    "parse_log_csharp": parse_log_csharp,
 }

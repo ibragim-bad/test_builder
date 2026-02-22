@@ -2,12 +2,32 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+# Timing patterns that some test runners embed in test names.
+# These are stripped from both actual (by log parsers) and expected names (below)
+# so that timing differences between runs don't cause spurious mismatches.
+_TIMING_NORMALIZE_RES = [
+    # PHP/JUnit bracket style: " [1.34 ms]" or "[123 ms]"
+    re.compile(r"\s*\[\s*\d+(?:\.\d+)?\s*(?:ms|s)\s*\]\s*$", re.IGNORECASE),
+    # Botan inline style: " in 29.08 msec" or " in 1 sec"
+    re.compile(r"\s+in\s+\d+(?:\.\d+)?\s+(?:msec|sec)\b", re.IGNORECASE),
+    # Parenthesised duration: " (1.234s)" or " (123ms)"
+    re.compile(r"\s*\(\s*\d+(?:\.\d+)?\s*(?:ms|s)\s*\)\s*$", re.IGNORECASE),
+]
+
+
+def _normalize_test_name(name: str) -> str:
+    """Strip known timing suffixes/infix patterns from a test name."""
+    for pattern in _TIMING_NORMALIZE_RES:
+        name = pattern.sub("", name)
+    return name.strip()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIB_DIR = REPO_ROOT / "lib"
@@ -135,9 +155,9 @@ def run_in_container(
 ) -> tuple[int, str]:
     cmd_lines = [
         "set -e",
-        "git clean -fdx",
-        f"git apply /patches/{patch_name}",
-        f"git apply /patches/{test_patch_name}",
+        "git reset --hard HEAD",
+        f"git apply -v --3way --recount --ignore-space-change --whitespace=nowarn /patches/{patch_name}",
+        f"git apply -v --3way --recount --ignore-space-change --whitespace=nowarn /patches/{test_patch_name}",
     ]
     for test_cmd in test_cmds:
         cmd_lines.append(test_cmd)
@@ -147,13 +167,15 @@ def run_in_container(
         "docker",
         "run",
         "--rm",
+        "--network", "host",
+        "-e", "_JAVA_OPTIONS=-Djava.net.preferIPv6Addresses=false",
         "-v",
         f"{patch_dir}:/patches:ro",
         "-w",
         workdir,
         image,
         "/bin/bash",
-        "-lc",
+        "-c",
         script,
     ]
 
@@ -214,11 +236,16 @@ def evaluate_instance(
     log_path.write_text(output, encoding="utf-8")
 
     parsed = parser(output)
+    # Normalize actual names (strip timing) in case the parser didn't already.
+    parsed = {_normalize_test_name(k): v for k, v in parsed.items()}
     passed = sorted(k for k, v in parsed.items() if v == "PASSED")
     failed = sorted(k for k, v in parsed.items() if v == "FAILED")
 
+    # Normalize expected names so timing differences between runs don't cause
+    # spurious mismatches (some datasets were captured with timing in test names).
     expected_passed = sorted(
-        spec.get("PASS_TO_PASS", []) + spec.get("FAIL_TO_PASS", [])
+        _normalize_test_name(n)
+        for n in spec.get("PASS_TO_PASS", []) + spec.get("FAIL_TO_PASS", [])
     )
 
     result = {
@@ -276,6 +303,14 @@ def maybe_pull_image(image: str, from_hf: bool) -> None:
         )
 
 
+def remove_image(image: str) -> None:
+    subprocess.run(
+        ["docker", "rmi", "-f", image],
+        check=False,
+        capture_output=True,
+    )
+
+
 def evaluate_task(
     spec: dict,
     from_hf: bool,
@@ -288,6 +323,7 @@ def evaluate_task(
     if not instance_id:
         return {"instance_id": "", "error": "Task missing instance_id."}
 
+    image = None
     try:
         image = resolve_task_image(
             spec=spec,
@@ -301,29 +337,33 @@ def evaluate_task(
         return {"instance_id": instance_id, "result": result}
     except Exception as exc:
         return {"instance_id": instance_id, "error": str(exc)}
+    finally:
+        if from_hf and image:
+            remove_image(image)
 
 
 def build_report_item(spec: dict, outcome: dict) -> dict:
     instance_id = spec.get("instance_id", "")
-    fail_to_pass_expected = set(spec.get("FAIL_TO_PASS", []))
-    pass_to_pass_expected = set(spec.get("PASS_TO_PASS", []))
+    # Normalize expected names to match what log parsers produce.
+    fail_to_pass_expected = {_normalize_test_name(n) for n in spec.get("FAIL_TO_PASS", [])}
+    pass_to_pass_expected = {_normalize_test_name(n) for n in spec.get("PASS_TO_PASS", [])}
     error = outcome.get("error")
     if error:
         return {
             "instance_id": instance_id,
             "from_fail_to_pass": [],
-            "failed_from_pass_to_fail": sorted(pass_to_pass_expected),
+            "failed_from_pass_to_pass": sorted(pass_to_pass_expected),
             "error": error,
         }
 
     result = outcome["result"]
     passed_actual = set(result.get("passed_actual", []))
     from_fail_to_pass = sorted(passed_actual.intersection(fail_to_pass_expected))
-    failed_from_pass_to_fail = sorted(pass_to_pass_expected.difference(passed_actual))
+    failed_from_pass_to_pass = sorted(pass_to_pass_expected.difference(passed_actual))
     return {
         "instance_id": instance_id,
         "from_fail_to_pass": from_fail_to_pass,
-        "failed_from_pass_to_fail": failed_from_pass_to_fail,
+        "failed_from_pass_to_pass": failed_from_pass_to_pass,
         "passed_match": result.get("passed_match", False),
         "exit_code": result.get("exit_code"),
         "log_path": result.get("log_path"),
