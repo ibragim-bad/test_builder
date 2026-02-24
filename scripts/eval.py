@@ -104,9 +104,7 @@ def load_specs_from_hf(
     while loaded < total:
         page = fetch_hf_rows(dataset, config, split, offset + loaded, per_page)
         page_rows = page.get("rows")
-        if not isinstance(page_rows, list):
-            break
-        if not page_rows:
+        if not isinstance(page_rows, list) or not page_rows:
             break
         for item in page_rows:
             if not isinstance(item, dict) or not isinstance(item.get("row"), dict):
@@ -126,8 +124,7 @@ def parse_instance_ids(value: str) -> list[str]:
 
 def filter_specs_by_instance_ids(specs: list[dict], wanted_ids: list[str]) -> list[dict]:
     wanted = set(wanted_ids)
-    filtered = [spec for spec in specs if spec.get("instance_id") in wanted]
-    return filtered
+    return [spec for spec in specs if spec.get("instance_id") in wanted]
 
 
 def get_parser(parser_name: str):
@@ -159,8 +156,7 @@ def run_in_container(
         f"git apply -v --3way --recount --ignore-space-change --whitespace=nowarn /patches/{patch_name}",
         f"git apply -v --3way --recount --ignore-space-change --whitespace=nowarn /patches/{test_patch_name}",
     ]
-    for test_cmd in test_cmds:
-        cmd_lines.append(test_cmd)
+    cmd_lines.extend(test_cmds)
     script = "\n".join(cmd_lines)
 
     docker_cmd = [
@@ -210,8 +206,8 @@ def evaluate_instance(
     parser = get_parser(parser_name)
 
     patch = spec.get("patch", "")
-    if patch_override and "patch" in patch_override:
-        patch = patch_override.get("patch", "")
+    if patch_override:
+        patch = patch_override.get("patch", patch)
     test_patch = spec.get("test_patch", "")
     if not patch or not test_patch:
         raise ValueError(f"Task {instance_id} missing patch/test_patch.")
@@ -220,14 +216,14 @@ def evaluate_instance(
 
     with tempfile.TemporaryDirectory(prefix="eval_patches_") as tmp:
         patch_dir = Path(tmp)
-        patch_path = write_patch(patch_dir, "patch.diff", patch)
-        test_patch_path = write_patch(patch_dir, "test_patch.diff", test_patch)
+        write_patch(patch_dir, "patch.diff", patch)
+        write_patch(patch_dir, "test_patch.diff", test_patch)
         exit_code, output = run_in_container(
             image=image,
             workdir=workdir,
             patch_dir=patch_dir,
-            patch_name=patch_path.name,
-            test_patch_name=test_patch_path.name,
+            patch_name="patch.diff",
+            test_patch_name="test_patch.diff",
             test_cmds=test_cmds,
         )
 
@@ -374,11 +370,7 @@ def build_report_item(spec: dict, outcome: dict) -> dict:
 def render_progress_bar(completed: int, total: int, width: int = 30) -> str:
     if total <= 0:
         return "[" + ("-" * width) + "]"
-    filled = int((completed / total) * width)
-    if filled < 0:
-        filled = 0
-    if filled > width:
-        filled = width
+    filled = max(0, min(width, int((completed / total) * width)))
     return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
 
 

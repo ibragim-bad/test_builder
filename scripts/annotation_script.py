@@ -113,7 +113,7 @@ def main() -> int:
         "--max-workers",
         type=int,
         default=50,
-        help="Max workers for API requests (default: 8).",
+        help="Max workers for API requests (default: 50).",
     )
     args = parser.parse_args()
 

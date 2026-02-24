@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import os
 import re
 import subprocess
 import sys
@@ -87,12 +86,12 @@ def main() -> int:
     for dockerfile in dockerfiles:
         image_name = derive_image_name(dockerfile.name, args.tag_suffix)
         tag = f"{args.registry}/{image_name}" if args.registry else image_name
-        cmd = ["docker", "build", "-f", str(dockerfile), "-t", tag]
-        if args.platform:
-            cmd.extend(["--platform", args.platform])
-        cmd.append(str(context_dir))
 
         if args.dry_run:
+            cmd = ["docker", "build", "-f", str(dockerfile), "-t", tag]
+            if args.platform:
+                cmd.extend(["--platform", args.platform])
+            cmd.append(str(context_dir))
             print(" ".join(cmd))
             continue
 
